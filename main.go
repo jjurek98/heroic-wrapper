@@ -1,10 +1,12 @@
 // heroic-wrapper: read-only Heroic Games Launcher game discovery and launch-command generator.
 // Linux, Go standard library only. This program NEVER creates/writes a file.
-// Build: go build -o heroic-wrapper heroic-wrapper.go
-// Usage: heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Title' | heroic-wrapper where gogdl|comet
+// Build: go build -o heroic-wrapper .
+// Usage: heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Title' | heroic-wrapper where gogdl|legendary|comet|nix
 // Override Heroic's config directory with HEROIC_CONFIG_DIR=/path/to/heroic.
 // Override runner paths with HEROIC_LEGENDARY_BIN, HEROIC_GOGDL_BIN, HEROIC_COMET_BIN, HEROIC_UMU_BIN.
 // Native packaged Heroic includes Legendary and gogdl; those are preferred to $PATH.
+// Nix: reuse the installed pkgs.heroic FHS runtime (HEROIC_BIN selects its launcher).
+// HEROIC_NIX_RUNTIME=auto|required|off controls Nix runtime wrapping.
 package main
 
 import (
@@ -392,6 +394,11 @@ func preferredBinary(envName, binary string) string {
 	if v, err := exec.LookPath(binary); err == nil {
 		return v
 	}
+	if envName == "HEROIC_UMU_BIN" {
+		if v := nixHeroicUMU(); v != "" {
+			return v
+		}
+	}
 	return binary // shell will resolve from PATH when the user runs it
 }
 func pathExists(p string) bool { _, err := os.Stat(p); return err == nil }
@@ -558,6 +565,7 @@ func candidateAppDirs() []string {
 	if custom := os.Getenv("HEROIC_INSTALL_DIR"); custom != "" {
 		dirs = append(dirs, expand(custom))
 	}
+	dirs = append(dirs, nixHeroicAppDirs()...)
 	dirs = append(dirs,
 		"/opt/Heroic", "/opt/heroic",
 		"/usr/lib/heroic-games-launcher-bin", "/usr/lib64/heroic-games-launcher-bin",
@@ -846,6 +854,14 @@ func cometInfo(g game) (string, bool, error) {
 }
 
 func buildCommand(g game, direct, disableComet bool) (string, error) {
+	var nixEnv *nixRuntime
+	var err error
+	if g.browserURL == "" && !strings.EqualFold(g.platform, "browser") {
+		nixEnv, err = resolveNixRuntime()
+		if err != nil {
+			return "", err
+		}
+	}
 	cfg, err := configSettings(g)
 	if err != nil {
 		return "", err
@@ -928,6 +944,7 @@ func buildCommand(g game, direct, disableComet bool) (string, error) {
 		}
 	}
 	env := map[string]string{}
+	inheritNixLibraryPath, captureNixLibraryPath := false, false
 	if direct {
 		// These are set by Heroic's actual launch command, but omitted by
 		// the legacy heroic-wrapper show. Only add them in the new mode.
@@ -1085,16 +1102,27 @@ func buildCommand(g game, direct, disableComet bool) (string, error) {
 			if !boolean(cfg, "preferSystemLibs", false) {
 				lib, lib32 := str(wineInfo["lib"]), str(wineInfo["lib32"])
 				var pieces []string
-				for _, p := range []string{lib, lib32, os.Getenv("LD_LIBRARY_PATH")} {
+				for _, p := range []string{lib, lib32} {
 					if p != "" {
 						pieces = append(pieces, p)
 					}
 				}
+				if nixEnv == nil && os.Getenv("LD_LIBRARY_PATH") != "" {
+					pieces = append(pieces, os.Getenv("LD_LIBRARY_PATH"))
+				}
 				if len(pieces) > 0 {
-					if _, ok := os.LookupEnv("ORIG_LD_LIBRARY_PATH"); !ok {
-						env["ORIG_LD_LIBRARY_PATH"] = os.Getenv("LD_LIBRARY_PATH")
+					// Explicit per-game values take precedence. Otherwise append
+					// the *launch-time* FHS path, not a host snapshot from 'show'.
+					if _, custom := env["LD_LIBRARY_PATH"]; !custom {
+						env["LD_LIBRARY_PATH"] = strings.Join(pieces, ":")
+						inheritNixLibraryPath = nixEnv != nil
+						if _, custom := env["ORIG_LD_LIBRARY_PATH"]; !custom {
+							if _, inherited := os.LookupEnv("ORIG_LD_LIBRARY_PATH"); !inherited {
+								env["ORIG_LD_LIBRARY_PATH"] = os.Getenv("LD_LIBRARY_PATH")
+								captureNixLibraryPath = nixEnv != nil
+							}
+						}
 					}
-					env["LD_LIBRARY_PATH"] = strings.Join(pieces, ":")
 					if pathExists(filepath.Join(lib, "gstreamer-1.0")) && pathExists(filepath.Join(lib32, "gstreamer-1.0")) {
 						env["GST_PLUGIN_SYSTEM_PATH_1_0"] = filepath.Join(lib, "gstreamer-1.0") + ":" + filepath.Join(lib32, "gstreamer-1.0")
 					}
@@ -1322,7 +1350,8 @@ func buildCommand(g game, direct, disableComet bool) (string, error) {
 	if !native && wineType != "wine" && wineType != "toolkit" && wineType != "proton" {
 		return "", fmt.Errorf("unsupported Wine runtime type %q", wineType)
 	}
-	if pathExists(filepath.Join(g.root, "tools", "runtimes", "umu", "umu_run.py")) && wineType == "proton" && !toolExists("umu-run") {
+	umu := preferredBinary("HEROIC_UMU_BIN", "umu-run")
+	if pathExists(filepath.Join(g.root, "tools", "runtimes", "umu", "umu_run.py")) && wineType == "proton" && !pathExists(umu) && !toolExists(umu) {
 		warnings = append(warnings, "Heroic has a bundled UMU inside its app; install host 'umu-run' for equivalent host execution")
 	}
 	if g.root == filepath.Join(os.Getenv("HOME"), ".var", "app", "com.heroicgameslauncher.hgl", "config", "heroic") {
@@ -1343,13 +1372,24 @@ func buildCommand(g game, direct, disableComet bool) (string, error) {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	parts := []string{"env"}
+	parts := []string{shellQuote("env")}
 	for _, key := range keys {
-		parts = append(parts, key+"="+env[key])
+		value := shellQuote(key + "=" + env[key])
+		if key == "LD_LIBRARY_PATH" && inheritNixLibraryPath {
+			value += `"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"`
+		} else if key == "ORIG_LD_LIBRARY_PATH" && captureNixLibraryPath {
+			value = `"ORIG_LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}"`
+		}
+		parts = append(parts, value)
 	}
-	parts = append(parts, args...)
+	parts = append(parts, shellJoin(args))
+	invocation := strings.Join(parts, " ")
 	var output strings.Builder
 	fmt.Fprintf(&output, "# %s [%s:%s]\n", strings.ReplaceAll(g.title, "\n", " "), g.store, g.id)
+	if nixEnv != nil {
+		fmt.Fprintln(&output, "# Nix: reuse Heroic's installed FHS runtime (graphics libraries, drivers and package overrides)")
+		fmt.Fprintln(&output, "# Nix launcher:", nixEnv.launcher)
+	}
 	if direct {
 		fmt.Fprintln(&output, "# Direct GOG launch: primary playTask read from goggame-<id>.info; no gogdl or cloud-save synchronization")
 	}
@@ -1361,22 +1401,28 @@ func buildCommand(g game, direct, disableComet bool) (string, error) {
 	}
 	var command string
 	if workingDirectory != "" {
-		command = fmt.Sprintf("( cd %s && %s )", shellQuote(workingDirectory), shellJoin(parts))
+		command = fmt.Sprintf("( cd %s && %s )", shellQuote(workingDirectory), invocation)
 	} else {
-		command = shellJoin(parts)
+		command = invocation
 	}
+	var launch strings.Builder
 	if comet.path != "" {
 		// Unlike Heroic we emit a standalone shell snippet rather than
 		// creating a supervising background daemon. The subshell traps EXIT
 		// and kills only the Comet instance that it started.
-		fmt.Fprintln(&output, "(")
-		fmt.Fprintf(&output, "  %s --from-heroic --username %s --quit &\n", shellQuote(comet.path), shellQuote(cometUsername))
-		fmt.Fprintln(&output, "  heroic_cmd_comet_pid=$!")
-		fmt.Fprintln(&output, `  trap 'kill "$heroic_cmd_comet_pid" 2>/dev/null || true' EXIT`)
-		fmt.Fprintf(&output, "  %s\n", command)
-		fmt.Fprintln(&output, ")")
+		fmt.Fprintln(&launch, "(")
+		fmt.Fprintf(&launch, "  %s --from-heroic --username %s --quit &\n", shellQuote(comet.path), shellQuote(cometUsername))
+		fmt.Fprintln(&launch, "  heroic_cmd_comet_pid=$!")
+		fmt.Fprintln(&launch, `  trap 'kill "$heroic_cmd_comet_pid" 2>/dev/null || true; wait "$heroic_cmd_comet_pid" 2>/dev/null || true' EXIT`)
+		fmt.Fprintf(&launch, "  %s\n", command)
+		fmt.Fprintln(&launch, ")")
 	} else {
-		fmt.Fprintln(&output, command)
+		fmt.Fprintln(&launch, command)
+	}
+	if nixEnv != nil {
+		fmt.Fprintln(&output, nixEnv.wrap(launch.String()))
+	} else {
+		output.WriteString(launch.String())
 	}
 	return output.String(), nil
 }
@@ -1384,11 +1430,23 @@ func toolExists(name string) bool { _, err := exec.LookPath(name); return err ==
 
 func run() error {
 	if len(os.Args) < 2 {
-		return errors.New("usage: heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Name' | heroic-wrapper where gogdl|comet")
+		return errors.New("usage: heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Name' | heroic-wrapper where gogdl|legendary|comet|nix")
 	}
 	if os.Args[1] == "where" {
+		if len(os.Args) == 3 && os.Args[2] == "nix" {
+			runtime, err := resolveNixRuntime()
+			if err != nil {
+				return err
+			}
+			if runtime == nil {
+				return errors.New("Nix runtime is disabled or no Nix Heroic launcher was found; set HEROIC_BIN to the installed pkgs.heroic executable")
+			}
+			fmt.Println(runtime.launcher)
+			fmt.Fprintln(os.Stderr, "Source: installed Heroic FHS launcher; /init is adapted in memory when the printed command runs")
+			return nil
+		}
 		if len(os.Args) != 3 || (os.Args[2] != "gogdl" && os.Args[2] != "legendary" && os.Args[2] != "comet") {
-			return errors.New("usage: heroic-wrapper where gogdl|legendary|comet")
+			return errors.New("usage: heroic-wrapper where gogdl|legendary|comet|nix")
 		}
 		roots := configRoots()
 		if len(roots) == 0 {
