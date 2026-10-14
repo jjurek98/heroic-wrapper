@@ -1,9 +1,9 @@
 // heroic-wrapper: read-only Heroic Games Launcher game discovery and launch-command generator.
 // Linux, Go standard library only. This program NEVER creates/writes a file.
 // Build: go build -o heroic-wrapper heroic-wrapper.go
-// Usage: heroic-wrapper list | heroic-wrapper show [--direct] 'Game Title' | heroic-wrapper where gogdl
+// Usage: heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Title' | heroic-wrapper where gogdl|comet
 // Override Heroic's config directory with HEROIC_CONFIG_DIR=/path/to/heroic.
-// Override runner paths with HEROIC_LEGENDARY_BIN, HEROIC_GOGDL_BIN, HEROIC_UMU_BIN.
+// Override runner paths with HEROIC_LEGENDARY_BIN, HEROIC_GOGDL_BIN, HEROIC_COMET_BIN, HEROIC_UMU_BIN.
 // Native packaged Heroic includes Legendary and gogdl; those are preferred to $PATH.
 package main
 
@@ -819,12 +819,56 @@ func resolveGogPath(root, relative string) (string, error) {
 	return current, nil
 }
 
-func buildCommand(g game, direct bool) (string, error) {
+// cometInfo returns Heroic's per-GOG-account username and whether Comet
+// integration is enabled in Heroic's global settings. Cloud-save auto-sync
+// is entirely separate and deliberately not used here.
+func cometInfo(g game) (string, bool, error) {
+	if g.store != "gog" {
+		return "", false, nil
+	}
+	global, err := jsonObject(filepath.Join(g.root, "config.json"))
+	if err != nil {
+		return "", false, err
+	}
+	defaults := obj(global["defaultSettings"])
+	if len(defaults) == 0 {
+		defaults = obj(global["settings"])
+	}
+	if !boolean(obj(defaults["experimentalFeatures"]), "cometSupport", true) {
+		return "", false, nil
+	}
+	gogConfig, err := jsonObject(filepath.Join(g.root, "gog_store", "config.json"))
+	if err != nil {
+		return "", false, err
+	}
+	username := str(obj(gogConfig["userData"])["username"])
+	return username, username != "", nil
+}
+
+func buildCommand(g game, direct, disableComet bool) (string, error) {
 	cfg, err := configSettings(g)
 	if err != nil {
 		return "", err
 	}
 	warnings := []string{}
+	var comet runnerLocation
+	var cometUsername string
+	if !disableComet && g.store == "gog" {
+		username, enabled, err := cometInfo(g)
+		if err != nil {
+			return "", fmt.Errorf("read Heroic's Comet settings: %w", err)
+		}
+		if enabled {
+			cometUsername = username
+			comet, err = resolveRunner(g, "HEROIC_COMET_BIN", "altCometBin", "comet")
+			if err != nil {
+				return "", fmt.Errorf("Heroic starts Comet for this GOG account, but %w", err)
+			}
+			if comet.note != "" {
+				warnings = append(warnings, comet.note)
+			}
+		}
+	}
 	if direct && g.store != "gog" {
 		return "", errors.New("--direct currently supports GOG games only")
 	}
@@ -1307,15 +1351,32 @@ func buildCommand(g game, direct bool) (string, error) {
 	var output strings.Builder
 	fmt.Fprintf(&output, "# %s [%s:%s]\n", strings.ReplaceAll(g.title, "\n", " "), g.store, g.id)
 	if direct {
-		fmt.Fprintln(&output, "# Direct GOG launch: primary playTask read from goggame-<id>.info; no gogdl or save synchronization")
+		fmt.Fprintln(&output, "# Direct GOG launch: primary playTask read from goggame-<id>.info; no gogdl or cloud-save synchronization")
+	}
+	if comet.path != "" {
+		fmt.Fprintln(&output, "# Heroic's GOG Galaxy identity service (Comet) is started independently of cloud-save syncing")
 	}
 	for _, warning := range warnings {
 		fmt.Fprintln(&output, "# NOTE:", warning)
 	}
+	var command string
 	if workingDirectory != "" {
-		fmt.Fprintf(&output, "( cd %s && %s )\n", shellQuote(workingDirectory), shellJoin(parts))
+		command = fmt.Sprintf("( cd %s && %s )", shellQuote(workingDirectory), shellJoin(parts))
 	} else {
-		fmt.Fprintf(&output, "%s\n", shellJoin(parts))
+		command = shellJoin(parts)
+	}
+	if comet.path != "" {
+		// Unlike Heroic we emit a standalone shell snippet rather than
+		// creating a supervising background daemon. The subshell traps EXIT
+		// and kills only the Comet instance that it started.
+		fmt.Fprintln(&output, "(")
+		fmt.Fprintf(&output, "  %s --from-heroic --username %s --quit &\n", shellQuote(comet.path), shellQuote(cometUsername))
+		fmt.Fprintln(&output, "  heroic_cmd_comet_pid=$!")
+		fmt.Fprintln(&output, `  trap 'kill "$heroic_cmd_comet_pid" 2>/dev/null || true' EXIT`)
+		fmt.Fprintf(&output, "  %s\n", command)
+		fmt.Fprintln(&output, ")")
+	} else {
+		fmt.Fprintln(&output, command)
 	}
 	return output.String(), nil
 }
@@ -1323,11 +1384,11 @@ func toolExists(name string) bool { _, err := exec.LookPath(name); return err ==
 
 func run() error {
 	if len(os.Args) < 2 {
-		return errors.New("usage: heroic-wrapper list | heroic-wrapper show [--direct] 'Game Name' | heroic-wrapper where gogdl")
+		return errors.New("usage: heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Name' | heroic-wrapper where gogdl|comet")
 	}
 	if os.Args[1] == "where" {
-		if len(os.Args) != 3 || (os.Args[2] != "gogdl" && os.Args[2] != "legendary") {
-			return errors.New("usage: heroic-wrapper where gogdl|legendary")
+		if len(os.Args) != 3 || (os.Args[2] != "gogdl" && os.Args[2] != "legendary" && os.Args[2] != "comet") {
+			return errors.New("usage: heroic-wrapper where gogdl|legendary|comet")
 		}
 		roots := configRoots()
 		if len(roots) == 0 {
@@ -1339,6 +1400,8 @@ func run() error {
 			envName, configKey := "HEROIC_GOGDL_BIN", "altGogdlBin"
 			if binary == "legendary" {
 				envName, configKey = "HEROIC_LEGENDARY_BIN", "altLegendaryBin"
+			} else if binary == "comet" {
+				envName, configKey = "HEROIC_COMET_BIN", "altCometBin"
 			}
 			location, err := resolveRunner(game{root: root}, envName, configKey, binary)
 			if err == nil {
@@ -1357,17 +1420,24 @@ func run() error {
 		return fmt.Errorf("unknown command %q (expected list, show, or where)", os.Args[1])
 	}
 	direct := false
+	disableComet := false
 	selector := ""
 	if os.Args[1] == "show" {
-		switch {
-		case len(os.Args) == 3:
-			selector = os.Args[2]
-		case len(os.Args) == 4 && os.Args[2] == "--direct":
-			direct, selector = true, os.Args[3]
-		case len(os.Args) == 4 && os.Args[3] == "--direct":
-			direct, selector = true, os.Args[2]
-		default:
-			return errors.New("usage: heroic-wrapper show [--direct] 'Game Name'")
+		for _, arg := range os.Args[2:] {
+			switch arg {
+			case "--direct":
+				direct = true
+			case "--no-comet":
+				disableComet = true
+			default:
+				if strings.HasPrefix(arg, "--") || selector != "" {
+					return errors.New("usage: heroic-wrapper show [--direct] [--no-comet] 'Game Name'")
+				}
+				selector = arg
+			}
+		}
+		if selector == "" {
+			return errors.New("usage: heroic-wrapper show [--direct] [--no-comet] 'Game Name'")
 		}
 	}
 	if os.Args[1] == "list" && len(os.Args) != 2 {
@@ -1387,7 +1457,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	result, err := buildCommand(chosen, direct)
+	result, err := buildCommand(chosen, direct, disableComet)
 	if err != nil {
 		return err
 	}
