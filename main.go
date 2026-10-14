@@ -1,7 +1,7 @@
 // heroic-wrapper: read-only Heroic Games Launcher game discovery and launch-command generator.
 // Linux, Go standard library only. This program NEVER creates/writes a file.
 // Build: go build -o heroic-wrapper heroic-wrapper.go
-// Usage: heroic-wrapper list | heroic-wrapper show 'Game Title' | heroic-wrapper where gogdl
+// Usage: heroic-wrapper list | heroic-wrapper show [--direct] 'Game Title' | heroic-wrapper where gogdl
 // Override Heroic's config directory with HEROIC_CONFIG_DIR=/path/to/heroic.
 // Override runner paths with HEROIC_LEGENDARY_BIN, HEROIC_GOGDL_BIN, HEROIC_UMU_BIN.
 // Native packaged Heroic includes Legendary and gogdl; those are preferred to $PATH.
@@ -698,14 +698,138 @@ func resolveRunner(g game, envName, configKey, binary string) (runnerLocation, e
 		binary, envName, binary)
 }
 
-func buildCommand(g game) (string, error) {
+// gogDirectTask selects the same primary playTask that gogdl launch selects,
+// without invoking gogdl or its cloud-save APIs. The .info file is installed
+// alongside the game itself (goggame-<productid>.info).
+func gogDirectTask(g game, exeOverride string) (executable, workingDirectory string, taskArgs []string, err error) {
+	infoPath := filepath.Join(g.directory, "goggame-"+g.id+".info")
+	info, err := jsonObject(infoPath)
+	if err != nil {
+		return "", "", nil, err
+	}
+	tasks := arr(info["playTasks"])
+	if len(tasks) == 0 {
+		return "", "", nil, fmt.Errorf("no playTasks in %s; gogdl would be unable to select a primary executable", infoPath)
+	}
+	var primary object
+	for _, raw := range tasks {
+		task := obj(raw)
+		if boolean(task, "isPrimary", false) {
+			primary = task
+			break
+		}
+	}
+	if primary == nil {
+		return "", "", nil, fmt.Errorf("no primary playTask in %s", infoPath)
+	}
+
+	workingDirectory = g.directory
+	if cwd := str(primary["workingDir"]); cwd != "" {
+		workingDirectory, err = resolveGogPath(g.directory, cwd)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("resolve GOG workingDir: %w", err)
+		}
+	}
+	executable, err = resolveGogPath(g.directory, str(primary["path"]))
+	if err != nil {
+		return "", "", nil, fmt.Errorf("resolve GOG executable: %w", err)
+	}
+	if override := strings.TrimSpace(exeOverride); override != "" {
+		if filepath.IsAbs(override) {
+			executable = expand(override)
+		} else {
+			executable, err = resolveGogPath(g.directory, override)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("resolve executable override: %w", err)
+			}
+		}
+		workingDirectory = filepath.Dir(executable) // matches gogdl --override-exe
+	}
+	if !pathExists(executable) {
+		return "", "", nil, fmt.Errorf("resolved executable %q does not exist", executable)
+	}
+	if !pathExists(workingDirectory) {
+		return "", "", nil, fmt.Errorf("resolved working directory %q does not exist", workingDirectory)
+	}
+
+	switch args := primary["arguments"].(type) {
+	case nil:
+	case string:
+		// gogdl converts Windows backslashes before shlex.split().
+		taskArgs, err = splitArgs(strings.ReplaceAll(args, `\`, `/`))
+		if err != nil {
+			return "", "", nil, fmt.Errorf("parse GOG playTask arguments: %w", err)
+		}
+	case []any:
+		for _, arg := range args {
+			word, ok := arg.(string)
+			if !ok {
+				return "", "", nil, fmt.Errorf("GOG playTask arguments contains non-string value")
+			}
+			taskArgs = append(taskArgs, word)
+		}
+	default:
+		return "", "", nil, fmt.Errorf("unsupported GOG playTask arguments type %T", primary["arguments"])
+	}
+	return executable, workingDirectory, taskArgs, nil
+}
+
+// Resolve paths encoded with Windows separators and tolerate Linux filename case
+// differences the same way gogdl's get_case_insensitive_name helper does.
+func resolveGogPath(root, relative string) (string, error) {
+	if strings.TrimSpace(relative) == "" {
+		return "", errors.New("empty path")
+	}
+	path := filepath.Join(root, filepath.FromSlash(strings.ReplaceAll(relative, `\`, `/`)))
+	if pathExists(path) {
+		return path, nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(strings.TrimPrefix(filepath.Clean(abs), string(os.PathSeparator)), string(os.PathSeparator))
+	current := string(os.PathSeparator)
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve %q: %w", path, err)
+		}
+		exact, folded := "", ""
+		for _, item := range entries {
+			if item.Name() == part {
+				exact = item.Name()
+				break
+			}
+			if strings.EqualFold(item.Name(), part) {
+				folded = item.Name()
+			}
+		}
+		if exact == "" {
+			exact = folded
+		}
+		if exact == "" {
+			return "", fmt.Errorf("%q not found (component %q)", path, part)
+		}
+		current = filepath.Join(current, exact)
+	}
+	return current, nil
+}
+
+func buildCommand(g game, direct bool) (string, error) {
 	cfg, err := configSettings(g)
 	if err != nil {
 		return "", err
 	}
 	warnings := []string{}
+	if direct && g.store != "gog" {
+		return "", errors.New("--direct currently supports GOG games only")
+	}
 	var runner runnerLocation
-	if g.store == "epic" || g.store == "gog" {
+	if g.store == "epic" || (g.store == "gog" && !direct) {
 		if g.store == "epic" {
 			runner, err = resolveRunner(g, "HEROIC_LEGENDARY_BIN", "altLegendaryBin", "legendary")
 		} else {
@@ -743,7 +867,31 @@ func buildCommand(g game) (string, error) {
 		workingDirectory = filepath.Dir(exe) // Heroic sideload launch uses executable's directory.
 	}
 	native := strings.EqualFold(g.platform, "linux") || strings.EqualFold(g.platform, "browser")
+	var directExe string
+	var directTaskArgs []string
+	if direct {
+		if native {
+			return "", errors.New("--direct currently supports Windows GOG games only")
+		}
+		// gogdl uses --override-exe only when Heroic requested an override.
+		override := ""
+		if exe != "" && exe != g.executable {
+			override = exe
+		}
+		directExe, workingDirectory, directTaskArgs, err = gogDirectTask(g, override)
+		if err != nil {
+			return "", err
+		}
+	}
 	env := map[string]string{}
+	if direct {
+		// These are set by Heroic's actual launch command, but omitted by
+		// the legacy heroic-wrapper show. Only add them in the new mode.
+		env["HEROIC_APP_NAME"] = g.id
+		env["HEROIC_APP_RUNNER"] = "gog"
+		env["HEROIC_APP_SOURCE"] = "gog"
+		env["LD_PRELOAD"] = ""
+	}
 	if g.directory != "" {
 		env["STEAM_COMPAT_INSTALL_PATH"] = g.directory
 	}
@@ -752,7 +900,9 @@ func buildCommand(g game) (string, error) {
 		env["LEGENDARY_CONFIG_PATH"] = filepath.Join(g.root, "legendaryConfig", "legendary")
 		env["STORE"], env["GAMEID"] = "egs", "umu-0"
 	case "gog":
-		env["GOGDL_CONFIG_PATH"] = filepath.Join(g.root, "gogdlConfig")
+		if !direct {
+			env["GOGDL_CONFIG_PATH"] = filepath.Join(g.root, "gogdlConfig")
+		}
 		env["STORE"], env["GAMEID"] = "gog", "umu-0"
 	case "sideload":
 		env["GAMEID"] = "umu-0"
@@ -1038,20 +1188,24 @@ func buildCommand(g game) (string, error) {
 			args = append(args, "--ubisoft")
 		}
 	case "gog":
-		args = []string{
-			runner.path,
-			"--auth-config-path", filepath.Join(g.root, "gog_store", "auth.json"),
-			"launch", g.directory,
+		if direct {
+			args = append([]string{directExe}, directTaskArgs...)
+		} else {
+			args = []string{
+				runner.path,
+				"--auth-config-path", filepath.Join(g.root, "gog_store", "auth.json"),
+				"launch", g.directory,
+			}
+			if exe != "" && exe != g.executable {
+				args = append(args, "--override-exe", exe)
+			}
+			id := g.id
+			if id == "1423049311" && boolean(obj(g.install["cyberpunk"]), "modsEnabled", false) {
+				id = "1597316373"
+				warnings = append(warnings, "Cyberpunk REDmod deployment is not reproduced")
+			}
+			args = append(args, id)
 		}
-		if exe != "" && exe != g.executable {
-			args = append(args, "--override-exe", exe)
-		}
-		id := g.id
-		if id == "1423049311" && boolean(obj(g.install["cyberpunk"]), "modsEnabled", false) {
-			id = "1597316373"
-			warnings = append(warnings, "Cyberpunk REDmod deployment is not reproduced")
-		}
-		args = append(args, id)
 	case "sideload":
 		if g.browserURL != "" {
 			args = []string{preferredBinary("HEROIC_BROWSER_BIN", "xdg-open"), g.browserURL}
@@ -1064,7 +1218,7 @@ func buildCommand(g game) (string, error) {
 		}
 	}
 
-	if g.store == "epic" || g.store == "gog" {
+	if g.store == "epic" || (g.store == "gog" && !direct) {
 		if !native {
 			if wineType == "proton" {
 				usingUMU := !boolean(cfg, "disableUMU", false)
@@ -1100,7 +1254,9 @@ func buildCommand(g game) (string, error) {
 		if g.browserURL == "" {
 			if !native {
 				if wineType == "proton" {
-					env["PROTON_VERB"] = "waitforexitandrun"
+					if !direct {
+						env["PROTON_VERB"] = "waitforexitandrun"
+					}
 					umu := preferredBinary("HEROIC_UMU_BIN", "umu-run")
 					if !boolean(cfg, "disableUMU", false) && (pathExists(umu) || toolExists(umu)) {
 						args = append(append(wrappers, umu), args...)
@@ -1150,6 +1306,9 @@ func buildCommand(g game) (string, error) {
 	parts = append(parts, args...)
 	var output strings.Builder
 	fmt.Fprintf(&output, "# %s [%s:%s]\n", strings.ReplaceAll(g.title, "\n", " "), g.store, g.id)
+	if direct {
+		fmt.Fprintln(&output, "# Direct GOG launch: primary playTask read from goggame-<id>.info; no gogdl or save synchronization")
+	}
 	for _, warning := range warnings {
 		fmt.Fprintln(&output, "# NOTE:", warning)
 	}
@@ -1164,7 +1323,7 @@ func toolExists(name string) bool { _, err := exec.LookPath(name); return err ==
 
 func run() error {
 	if len(os.Args) < 2 {
-		return errors.New("usage: heroic-wrapper list | heroic-wrapper show 'Game Name' | heroic-wrapper where gogdl")
+		return errors.New("usage: heroic-wrapper list | heroic-wrapper show [--direct] 'Game Name' | heroic-wrapper where gogdl")
 	}
 	if os.Args[1] == "where" {
 		if len(os.Args) != 3 || (os.Args[2] != "gogdl" && os.Args[2] != "legendary") {
@@ -1197,8 +1356,19 @@ func run() error {
 	if os.Args[1] != "list" && os.Args[1] != "show" {
 		return fmt.Errorf("unknown command %q (expected list, show, or where)", os.Args[1])
 	}
-	if os.Args[1] == "show" && len(os.Args) != 3 {
-		return errors.New("usage: heroic-wrapper show 'Game Name'")
+	direct := false
+	selector := ""
+	if os.Args[1] == "show" {
+		switch {
+		case len(os.Args) == 3:
+			selector = os.Args[2]
+		case len(os.Args) == 4 && os.Args[2] == "--direct":
+			direct, selector = true, os.Args[3]
+		case len(os.Args) == 4 && os.Args[3] == "--direct":
+			direct, selector = true, os.Args[2]
+		default:
+			return errors.New("usage: heroic-wrapper show [--direct] 'Game Name'")
+		}
 	}
 	if os.Args[1] == "list" && len(os.Args) != 2 {
 		return errors.New("usage: heroic-wrapper list")
@@ -1213,11 +1383,11 @@ func run() error {
 		}
 		return nil
 	}
-	chosen, err := pick(games, os.Args[2])
+	chosen, err := pick(games, selector)
 	if err != nil {
 		return err
 	}
-	result, err := buildCommand(chosen)
+	result, err := buildCommand(chosen, direct)
 	if err != nil {
 		return err
 	}
