@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -33,7 +32,10 @@ type preparedMsg struct {
 	command string
 	err     error
 }
-type authenticatedMsg struct{ err error }
+type authenticatedMsg struct {
+	attempt *sudoAttempt
+	err     error
+}
 type startedMsg struct {
 	session *gameSession
 	err     error
@@ -60,10 +62,13 @@ type guiModel struct {
 	loading     bool
 	busy        bool
 	stopping    bool
-	confirmQuit bool
+	starting    bool
+	dialog      guiDialog
+	auth        *sudoAttempt
 	quitting    bool
 	status      string
 	playing     string
+	network     string
 	plan        *launchPlan
 	session     *gameSession
 	output      *gameLog
@@ -92,6 +97,7 @@ func runGUI() error {
 		loading: true, status: "Loading installed games...", output: &gameLog{},
 		logView: viewport.New(58, 5), follow: true,
 	}
+	defer model.dismissDialog()
 	model.logView.SetHorizontalStep(4)
 	model.logView.SetContent("Select a game, then a network namespace, and press enter to launch.")
 	_, err := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion(),
@@ -143,7 +149,8 @@ func (m *guiModel) syncLogs() {
 }
 
 func (m *guiModel) launchError(err error) (tea.Model, tea.Cmd) {
-	m.busy = false
+	m.dismissDialog()
+	m.busy, m.starting, m.plan = false, false, nil
 	m.status = "Launch failed: " + err.Error()
 	fmt.Fprintln(m.output, "\n[heroic-wrapper]", m.status)
 	m.syncLogs()
@@ -155,6 +162,7 @@ func (m *guiModel) launchError(err error) (tea.Model, tea.Cmd) {
 
 func (m *guiModel) startPrepared() tea.Cmd {
 	ctx, launcher, plan, output := m.ctx, m.launcher, m.plan, m.output
+	m.starting = true
 	m.status = "Starting " + m.playing
 	return func() tea.Msg {
 		session, err := launcher.start(ctx, plan, output)
@@ -169,7 +177,9 @@ func (m *guiModel) beginLaunch() tea.Cmd {
 	chosen := m.games[m.matches[m.gameCursor]]
 	namespace := m.namespaces[m.nsCursor]
 	m.playing = displayLine(chosen.title) + " / " + namespaceLabel(namespace)
-	m.busy, m.stopping, m.confirmQuit = true, false, false
+	m.network = namespace
+	m.dismissDialog()
+	m.busy, m.stopping, m.starting, m.plan = true, false, false, nil
 	m.output, m.logRevision, m.follow = &gameLog{}, 0, true
 	m.logView.SetContent("")
 	m.logView.GotoTop()
@@ -189,22 +199,11 @@ func (m *guiModel) beginLaunch() tea.Cmd {
 	}
 }
 
-func (m *guiModel) requestQuit(force bool) (tea.Model, tea.Cmd) {
+func (m *guiModel) requestQuit() (tea.Model, tea.Cmd) {
 	if !m.busy {
 		return m, tea.Quit
 	}
-	if !force && !m.confirmQuit {
-		m.confirmQuit = true
-		m.status = "A launch is active. Press q again to stop and quit; esc to cancel."
-		return m, nil
-	}
-	m.quitting, m.stopping = true, true
-	m.status = "Stopping the launch before quitting..."
-	if m.session != nil {
-		m.session.cancel()
-	}
-	// Wait for a pending preparation/start message rather than orphaning a
-	// child that might be starting concurrently with this keystroke.
+	m.dialog = guiDialog{kind: dialogQuit}
 	return m, nil
 }
 
@@ -248,22 +247,29 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.syncLogs()
-		if m.plan.sudo != "" {
-			m.status = "Authenticating with sudo on the terminal..."
-			return m, tea.ExecProcess(exec.Command(m.plan.sudo, "-v"), func(err error) tea.Msg {
-				return authenticatedMsg{err}
-			})
+		// A quit confirmation can open while buildCommand is still working.
+		// Keep that dialog in front and defer authentication/start until cancel.
+		if m.dialog.kind == dialogQuit {
+			return m, nil
 		}
-		return m, m.startPrepared()
+		return m, m.continuePrepared()
 	case authenticatedMsg:
-		if m.quitting {
-			return m, tea.Quit
+		// Ignore a late result after cancellation or a subsequent launch.
+		if msg.attempt == nil || msg.attempt != m.auth {
+			return m, nil
 		}
+		m.auth = nil
 		if msg.err != nil {
-			return m.launchError(fmt.Errorf("sudo authentication: %w", msg.err))
+			m.status = "Sudo authentication required; enter a password or cancel."
+			if !msg.attempt.probe {
+				m.dialog.problem = msg.err.Error()
+			}
+			return m, nil
 		}
+		m.dismissDialog()
 		return m, m.startPrepared()
 	case startedMsg:
+		m.starting = false
 		if msg.err != nil {
 			return m.launchError(msg.err)
 		}
@@ -284,7 +290,9 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.session != m.session {
 			return m, nil
 		}
-		m.busy, m.session = false, nil
+		m.busy, m.session, m.plan = false, nil, nil
+		// The game may finish naturally while a confirmation is visible.
+		m.dismissDialog()
 		m.status = "Finished " + m.playing
 		if m.stopping {
 			m.status = "Stopped " + m.playing
@@ -298,12 +306,15 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
-		key := msg.String()
-		if key == "ctrl+c" {
-			return m.requestQuit(true)
+		if m.dialog.kind != dialogNone {
+			return m.updateDialog(msg)
 		}
 		if m.quitting {
 			return m, nil
+		}
+		key := msg.String()
+		if key == "ctrl+c" {
+			return m.requestQuit()
 		}
 		if m.filtering {
 			switch key {
@@ -324,9 +335,8 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key == "q" {
-			return m.requestQuit(false)
+			return m.requestQuit()
 		}
-		m.confirmQuit = false
 		switch key {
 		case "tab":
 			m.focus = (m.focus + 1) % 3
@@ -346,8 +356,7 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "s":
 			if m.session != nil && !m.stopping {
-				m.stopping, m.status = true, "Stopping "+m.playing
-				m.session.cancel()
+				m.dialog = guiDialog{kind: dialogStop}
 			}
 		case "f":
 			m.focus, m.follow = focusLogs, true
@@ -389,6 +398,9 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.MouseMsg:
+		if m.dialog.kind != dialogNone || m.quitting {
+			return m, nil
+		}
 		if m.focus == focusLogs {
 			var cmd tea.Cmd
 			m.logView, cmd = m.logView.Update(msg)
@@ -448,12 +460,12 @@ func guiPanel(title, content string, width int, focused bool) string {
 	return style.Render(guiTitle.Render(clippedLine(title, width)) + "\n" + content)
 }
 
-func (m *guiModel) View() string {
+func (m *guiModel) layoutView() string {
 	if m.width == 0 {
 		return "Opening Heroic Wrapper..."
 	}
 	if m.width < 60 || m.height < 20 {
-		return "Resize the terminal to at least 60 columns and 20 rows.\nq: quit (twice during a launch); ctrl+c: stop and quit."
+		return "Resize the terminal to at least 60 columns and 20 rows.\nq/ctrl+c: quit (confirmation during a launch)."
 	}
 	gameWidth := m.width*2/3 - 2
 	namespaceWidth := m.width - gameWidth - 4

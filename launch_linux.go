@@ -111,8 +111,8 @@ func prepareLaunch(command, namespace string) (*launchPlan, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Authenticate separately on the real terminal. -n prevents a late
-		// password prompt from competing with Bubble Tea or entering the logs.
+		// Authenticate separately through the TUI password dialog. -n prevents
+		// a late password prompt from competing with the UI or entering logs.
 		plan.args = append([]string{"-n", "-E", "--", ip}, plan.args...)
 		plan.program = plan.sudo
 	}
