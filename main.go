@@ -1,20 +1,25 @@
 // heroic-wrapper: read-only Heroic Games Launcher game discovery and launch-command generator.
 // Linux, Go standard library only. This program NEVER creates/writes a file.
 // Build: go build -o heroic-wrapper heroic-wrapper.go
-// Usage: heroic-wrapper list | heroic-wrapper show 'Game Title' | heroic-wrapper show epic:APP_ID
+// Usage: heroic-wrapper list | heroic-wrapper show 'Game Title' | heroic-wrapper where gogdl
 // Override Heroic's config directory with HEROIC_CONFIG_DIR=/path/to/heroic.
-// Override host runner paths with HEROIC_LEGENDARY_BIN, HEROIC_GOGDL_BIN, HEROIC_UMU_BIN.
+// Override runner paths with HEROIC_LEGENDARY_BIN, HEROIC_GOGDL_BIN, HEROIC_UMU_BIN.
+// Native packaged Heroic includes Legendary and gogdl; those are preferred to $PATH.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 type object = map[string]any
@@ -391,12 +396,328 @@ func preferredBinary(envName, binary string) string {
 }
 func pathExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
+// runnerLocation is a host-visible executable path, not the path inside a
+// Flatpak sandbox. The source is only used by the 'where' diagnostics.
+type runnerLocation struct {
+	path, source, note string
+}
+
+func executablePath(path string) (string, bool) {
+	path = expand(strings.TrimSpace(path))
+	if path == "" {
+		return "", false
+	}
+	if !strings.ContainsRune(path, os.PathSeparator) {
+		resolved, err := exec.LookPath(path)
+		if err != nil {
+			return "", false
+		}
+		path = resolved
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false
+	}
+	info, err := os.Stat(abs)
+	return abs, err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
+}
+
+func runnerArchitectures() []string {
+	arch := runtime.GOARCH
+	switch arch {
+	case "amd64":
+		arch = "x64" // Heroic uses Electron's process.arch, not Go's GOARCH
+	case "386":
+		arch = "ia32"
+	}
+	if arch == "x64" {
+		return []string{arch}
+	}
+	return []string{arch, "x64"} // Same fallback as Heroic
+}
+
+// Find within known Heroic application layouts; do not recurse over the whole disk.
+func runnerUnderAppDir(root, binary string) string {
+	bases := []string{
+		filepath.Join(root, "resources", "app.asar.unpacked", "build", "bin"),
+		filepath.Join(root, "app.asar.unpacked", "build", "bin"),
+		filepath.Join(root, "build", "bin"),
+		filepath.Join(root, "usr", "share", "heroic", "resources", "app.asar.unpacked", "build", "bin"),
+		filepath.Join(root, "usr", "lib", "heroic", "resources", "app.asar.unpacked", "build", "bin"),
+	}
+	for _, base := range bases {
+		for _, arch := range runnerArchitectures() {
+			if p, ok := executablePath(filepath.Join(base, arch, "linux", binary)); ok {
+				return p
+			}
+		}
+		// Older builds lack the architecture directory.
+		if p, ok := executablePath(filepath.Join(base, "linux", binary)); ok {
+			return p
+		}
+	}
+	return ""
+}
+
+func flatpakInstallLocations() []string {
+	home, _ := os.UserHomeDir()
+	locations := []string{}
+	if flatpak, err := exec.LookPath("flatpak"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		output, err := exec.CommandContext(ctx, flatpak, "info", "--show-location", "com.heroicgameslauncher.hgl").Output()
+		if err == nil {
+			location := strings.TrimSpace(string(output))
+			if filepath.IsAbs(location) {
+				locations = append(locations, location)
+			}
+		}
+	}
+	// Flatpak may be installed without its CLI in this execution environment.
+	// These are normal symlinks to the active per-user/system installation.
+	for _, base := range []string{
+		filepath.Join(home, ".local", "share", "flatpak"),
+		"/var/lib/flatpak",
+	} {
+		for _, arch := range []string{runtime.GOARCH, "x86_64", "aarch64"} {
+			if arch == "amd64" {
+				arch = "x86_64"
+			}
+			if arch == "arm64" {
+				arch = "aarch64"
+			}
+			locations = append(locations,
+				filepath.Join(base, "app", "com.heroicgameslauncher.hgl", arch, "stable", "active"))
+		}
+	}
+	return locations
+}
+
+// /app/... is only meaningful in the sandbox. Translate to the Flatpak's
+// *host-side* installation path without copying/extracting any files.
+func flatpakHostPath(sandboxPath string) string {
+	if !strings.HasPrefix(sandboxPath, "/app/") {
+		return ""
+	}
+	relative := strings.TrimPrefix(sandboxPath, "/app/")
+	for _, location := range flatpakInstallLocations() {
+		candidate := filepath.Join(location, "files", relative)
+		if p, ok := executablePath(candidate); ok {
+			return p
+		}
+	}
+	return ""
+}
+
+func flatpakBundledRunner(binary string) string {
+	for _, location := range flatpakInstallLocations() {
+		for _, appDir := range []string{
+			filepath.Join(location, "files", "bin", "heroic"),
+			filepath.Join(location, "files", "share", "heroic"),
+			filepath.Join(location, "files", "lib", "heroic"),
+		} {
+			if p := runnerUnderAppDir(appDir, binary); p != "" {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+func isFlatpakExecutable(path string) bool {
+	return strings.Contains(path, "/flatpak/app/com.heroicgameslauncher.hgl/")
+}
+
+func asRunnerLocation(path, source string) runnerLocation {
+	location := runnerLocation{path: path, source: source}
+	if isFlatpakExecutable(path) {
+		location.note = "Using Heroic's Flatpak-bundled runner by its host path; it may need Flatpak runtime libraries not available on the host. If execution fails, install a host-compatible gogdl/legendary and set HEROIC_GOGDL_BIN/HEROIC_LEGENDARY_BIN."
+	}
+	if strings.HasPrefix(path, "/tmp/.mount_") {
+		location.note = "Using a running AppImage's temporary mount; path only works while its AppImage remains mounted."
+	}
+	return location
+}
+
+// An explicit setting with /app/... may come from the Flatpak configuration;
+// map it to the host's readable path if possible.
+func specifiedRunnerPath(path, source string) (runnerLocation, error) {
+	path = expand(path)
+	if p, ok := executablePath(path); ok {
+		return asRunnerLocation(p, source), nil
+	}
+	if p := flatpakHostPath(path); p != "" {
+		return asRunnerLocation(p, source+" (Flatpak path translated to host)"), nil
+	}
+	return runnerLocation{}, fmt.Errorf("%s points to %q, which is not an executable on the host", source, path)
+}
+
+func candidateAppDirs() []string {
+	home, _ := os.UserHomeDir()
+	dirs := []string{}
+	if custom := os.Getenv("HEROIC_INSTALL_DIR"); custom != "" {
+		dirs = append(dirs, expand(custom))
+	}
+	dirs = append(dirs,
+		"/opt/Heroic", "/opt/heroic",
+		"/usr/lib/heroic-games-launcher-bin", "/usr/lib64/heroic-games-launcher-bin",
+		"/usr/lib/heroic-games-launcher", "/usr/lib64/heroic-games-launcher",
+		"/usr/lib/heroic", "/usr/lib64/heroic", "/usr/share/heroic",
+		"/usr/share/heroic-games-launcher",
+		filepath.Join(home, ".local", "opt", "Heroic"),
+		filepath.Join(home, "Applications", "Heroic"),
+	)
+	if mounts, _ := filepath.Glob("/tmp/.mount_*"); len(mounts) > 0 {
+		for _, dir := range mounts {
+			if strings.Contains(strings.ToLower(filepath.Base(dir)), "heroic") {
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+	// Inspect *running* Heroic executables so portable/native installations
+	// at arbitrary paths work without scanning the entire filesystem.
+	if processes, err := os.ReadDir("/proc"); err == nil {
+		for _, process := range processes {
+			if !process.IsDir() || process.Name() == "" || process.Name()[0] < '0' || process.Name()[0] > '9' {
+				continue
+			}
+			path, err := os.Readlink(filepath.Join("/proc", process.Name(), "exe"))
+			if err != nil {
+				continue
+			}
+			name := strings.ToLower(filepath.Base(path))
+			if strings.Contains(name, "heroic") && !strings.Contains(name, "heroic-wrapper") {
+				dirs = append(dirs, filepath.Dir(path))
+			}
+		}
+	}
+	return dirs
+}
+
+func logLocations(root string) []string {
+	home, _ := os.UserHomeDir()
+	nativeState := os.Getenv("XDG_STATE_HOME")
+	if nativeState == "" {
+		nativeState = filepath.Join(home, ".local", "state")
+	}
+	basePaths := []string{
+		filepath.Join(nativeState, "Heroic", "logs"),
+		filepath.Join(home, ".local", "state", "Heroic", "logs"),
+		filepath.Join(home, ".var", "app", "com.heroicgameslauncher.hgl", ".local", "state", "Heroic", "logs"),
+		filepath.Join(root, "logs"), // older releases
+	}
+	var result []string
+	for _, base := range basePaths {
+		result = append(result,
+			filepath.Join(base, "heroic.log"), filepath.Join(base, "heroic.log.old"),
+			filepath.Join(base, "runners", "gog.log"), filepath.Join(base, "runners", "legendary.log"))
+	}
+	return result
+}
+
+// Heroic logs the exact runner path on startup. This also handles custom
+// installation prefixes (Nix, portable folders, etc.) without deep scanning.
+func pathsFromHeroicLog(path, binary string) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	if stat, err := f.Stat(); err == nil && stat.Size() > 4*1024*1024 {
+		_, _ = f.Seek(-4*1024*1024, io.SeekEnd)
+	}
+	data, _ := io.ReadAll(io.LimitReader(f, 4*1024*1024))
+	lines := strings.Split(string(data), "\n")
+	var results []string
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
+		for _, marker := range []string{binary + " location:", strings.ToUpper(binary) + " location:"} {
+			if pos := strings.Index(strings.ToLower(line), strings.ToLower(marker)); pos >= 0 {
+				value := strings.Trim(strings.TrimSpace(line[pos+len(marker):]), "\"'")
+				if filepath.IsAbs(value) {
+					results = append(results, value)
+				}
+			}
+		}
+		if !strings.Contains(line, "/"+binary) {
+			continue
+		}
+		// Heroic's command logs generally contain a space-delimited executable
+		// right before ' --auth-config-path', '--version', 'launch', etc.
+		if pos := strings.Index(line, "Running command:"); pos >= 0 {
+			line = line[pos+len("Running command:"):]
+		}
+		if tokens, err := splitArgs(line); err == nil {
+			for _, token := range tokens {
+				if strings.HasSuffix(token, "/"+binary) && filepath.IsAbs(token) {
+					results = append(results, token)
+				}
+			}
+		}
+	}
+	return results
+}
+
+// Heroic's actual preference is override -> configured binary -> bundled.
+// A host-side CLI cannot access Electron's runtime __dirname, so we additionally
+// inspect Heroic's logs, running processes, and Flatpak's on-disk installation.
+// Never return a bare gogdl/legendary: 'show' must be pasteable and meaningful.
+func resolveRunner(g game, envName, configKey, binary string) (runnerLocation, error) {
+	if override := os.Getenv(envName); override != "" {
+		return specifiedRunnerPath(override, envName)
+	}
+	if cfg, err := jsonObject(filepath.Join(g.root, "config.json")); err == nil {
+		defaults := obj(cfg["defaultSettings"])
+		if len(defaults) == 0 {
+			defaults = obj(cfg["settings"])
+		}
+		if path := str(defaults[configKey]); path != "" {
+			return specifiedRunnerPath(path, "Heroic config.json "+configKey)
+		}
+	}
+	for _, log := range logLocations(g.root) {
+		for _, candidate := range pathsFromHeroicLog(log, binary) {
+			if loc, err := specifiedRunnerPath(candidate, "Heroic log "+log); err == nil {
+				return loc, nil
+			}
+		}
+	}
+	for _, dir := range candidateAppDirs() {
+		if p := runnerUnderAppDir(dir, binary); p != "" {
+			return asRunnerLocation(p, "Heroic bundled runner"), nil
+		}
+	}
+	if p, ok := executablePath(binary); ok {
+		return asRunnerLocation(p, "host $PATH"), nil
+	}
+	if p := flatpakBundledRunner(binary); p != "" {
+		return asRunnerLocation(p, "Flatpak installation (host path)"), nil
+	}
+	return runnerLocation{}, fmt.Errorf(
+		"cannot find Heroic's %s binary. Use %s=/absolute/path/to/%s; if Heroic is a Flatpak, inspect: flatpak info --show-location com.heroicgameslauncher.hgl",
+		binary, envName, binary)
+}
+
 func buildCommand(g game) (string, error) {
 	cfg, err := configSettings(g)
 	if err != nil {
 		return "", err
 	}
 	warnings := []string{}
+	var runner runnerLocation
+	if g.store == "epic" || g.store == "gog" {
+		if g.store == "epic" {
+			runner, err = resolveRunner(g, "HEROIC_LEGENDARY_BIN", "altLegendaryBin", "legendary")
+		} else {
+			runner, err = resolveRunner(g, "HEROIC_GOGDL_BIN", "altGogdlBin", "gogdl")
+		}
+		if err != nil {
+			return "", err
+		}
+		if runner.note != "" {
+			warnings = append(warnings, runner.note)
+		}
+	}
 	gameArgs, err := splitArgs(str(cfg["launcherArgs"]))
 	if err != nil {
 		return "", fmt.Errorf("launcherArgs: %w", err)
@@ -699,7 +1020,7 @@ func buildCommand(g game) (string, error) {
 		if str(launchOpt["type"]) == "dlc" {
 			id = nonempty(str(launchOpt["dlcAppName"]), id)
 		}
-		args = []string{preferredBinary("HEROIC_LEGENDARY_BIN", "legendary"), "launch", id}
+		args = []string{runner.path, "launch", id}
 		args = append(args, gameArgs...) // Heroic Legendary places extra arguments before launcher flags.
 		if exe != "" && exe != g.executable {
 			args = append(args, "--override-exe", exe)
@@ -718,7 +1039,7 @@ func buildCommand(g game) (string, error) {
 		}
 	case "gog":
 		args = []string{
-			preferredBinary("HEROIC_GOGDL_BIN", "gogdl"),
+			runner.path,
 			"--auth-config-path", filepath.Join(g.root, "gog_store", "auth.json"),
 			"launch", g.directory,
 		}
@@ -801,12 +1122,6 @@ func buildCommand(g game) (string, error) {
 	if !native && wineType != "wine" && wineType != "toolkit" && wineType != "proton" {
 		return "", fmt.Errorf("unsupported Wine runtime type %q", wineType)
 	}
-	if g.store == "epic" && !toolExists(preferredBinary("HEROIC_LEGENDARY_BIN", "legendary")) && !pathExists(preferredBinary("HEROIC_LEGENDARY_BIN", "legendary")) {
-		warnings = append(warnings, "legendary CLI not found on host; install it or set HEROIC_LEGENDARY_BIN")
-	}
-	if g.store == "gog" && !toolExists(preferredBinary("HEROIC_GOGDL_BIN", "gogdl")) && !pathExists(preferredBinary("HEROIC_GOGDL_BIN", "gogdl")) {
-		warnings = append(warnings, "gogdl CLI not found on host; install it or set HEROIC_GOGDL_BIN")
-	}
 	if pathExists(filepath.Join(g.root, "tools", "runtimes", "umu", "umu_run.py")) && wineType == "proton" && !toolExists("umu-run") {
 		warnings = append(warnings, "Heroic has a bundled UMU inside its app; install host 'umu-run' for equivalent host execution")
 	}
@@ -849,10 +1164,38 @@ func toolExists(name string) bool { _, err := exec.LookPath(name); return err ==
 
 func run() error {
 	if len(os.Args) < 2 {
-		return errors.New("usage: heroic-wrapper list | heroic-wrapper show 'Game Name' | heroic-wrapper show epic:APP_ID")
+		return errors.New("usage: heroic-wrapper list | heroic-wrapper show 'Game Name' | heroic-wrapper where gogdl")
+	}
+	if os.Args[1] == "where" {
+		if len(os.Args) != 3 || (os.Args[2] != "gogdl" && os.Args[2] != "legendary") {
+			return errors.New("usage: heroic-wrapper where gogdl|legendary")
+		}
+		roots := configRoots()
+		if len(roots) == 0 {
+			return errors.New("no Heroic config directory found; set HEROIC_CONFIG_DIR")
+		}
+		var lastErr error
+		for _, root := range roots {
+			binary := os.Args[2]
+			envName, configKey := "HEROIC_GOGDL_BIN", "altGogdlBin"
+			if binary == "legendary" {
+				envName, configKey = "HEROIC_LEGENDARY_BIN", "altLegendaryBin"
+			}
+			location, err := resolveRunner(game{root: root}, envName, configKey, binary)
+			if err == nil {
+				fmt.Println(location.path)
+				fmt.Fprintln(os.Stderr, "Source:", location.source)
+				if location.note != "" {
+					fmt.Fprintln(os.Stderr, "NOTE:", location.note)
+				}
+				return nil
+			}
+			lastErr = err
+		}
+		return lastErr
 	}
 	if os.Args[1] != "list" && os.Args[1] != "show" {
-		return fmt.Errorf("unknown command %q (expected list or show)", os.Args[1])
+		return fmt.Errorf("unknown command %q (expected list, show, or where)", os.Args[1])
 	}
 	if os.Args[1] == "show" && len(os.Args) != 3 {
 		return errors.New("usage: heroic-wrapper show 'Game Name'")
@@ -881,6 +1224,7 @@ func run() error {
 	fmt.Print(result)
 	return nil
 }
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "heroic-wrapper:", err)
