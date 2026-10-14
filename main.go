@@ -1,7 +1,7 @@
-// heroic-wrapper: read-only Heroic Games Launcher game discovery and launch-command generator.
-// Linux, Go standard library only. This program NEVER creates/writes a file.
+// heroic-wrapper: Heroic game discovery, launch-command generation and terminal UI.
+// Linux. Discovery is read-only; the interactive UI launches installed games.
 // Build: go build -o heroic-wrapper .
-// Usage: heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Title' | heroic-wrapper where gogdl|legendary|comet|nix
+// Usage: heroic-wrapper | heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Title' | heroic-wrapper where gogdl|legendary|comet|nix
 // Override Heroic's config directory with HEROIC_CONFIG_DIR=/path/to/heroic.
 // Override runner paths with HEROIC_LEGENDARY_BIN, HEROIC_GOGDL_BIN, HEROIC_COMET_BIN, HEROIC_UMU_BIN.
 // Native packaged Heroic includes Legendary and gogdl; those are preferred to $PATH.
@@ -1429,8 +1429,8 @@ func buildCommand(g game, direct, disableComet bool) (string, error) {
 func toolExists(name string) bool { _, err := exec.LookPath(name); return err == nil }
 
 func run() error {
-	if len(os.Args) < 2 {
-		return errors.New("usage: heroic-wrapper list | heroic-wrapper show [--direct] [--no-comet] 'Game Name' | heroic-wrapper where gogdl|legendary|comet|nix")
+	if len(os.Args) == 1 {
+		return runGUI()
 	}
 	if os.Args[1] == "where" {
 		if len(os.Args) == 3 && os.Args[2] == "nix" {
