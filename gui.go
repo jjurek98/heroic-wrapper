@@ -221,6 +221,10 @@ func (m *guiModel) requestQuit() (tea.Model, tea.Cmd) {
 
 func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
+	case tokenCopiedMsg:
+		return m.tokenCopied(msg)
+	case tokenRawClosedMsg:
+		return m.tokenRawClosed(msg)
 	case lanStartedMsg:
 		return m.updateLANStarted(msg)
 	case lanTickMsg:
@@ -376,7 +380,7 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.lanLogs, m.focus = true, focusLogs
 		case "t":
 			if m.lan.token != "" && (!m.busy || m.session != nil) {
-				m.showLANMessage("LAN server token", m.lan.token)
+				m.showLANToken()
 			}
 		case "tab":
 			m.focus = (m.focus + 1) % 3

@@ -378,6 +378,9 @@ func (m *guiModel) lanDialogContent(width int, compact bool) string {
 			input = "Token: ..." + dialogSlice(m.dialog.text+"_", max(0, lipgloss.Width(m.dialog.text+"_")-width+10), max(1, width-10))
 		}
 		help = "enter: connect | ctrl+u: clear | esc: cancel"
+	case dialogLANToken:
+		title, body = m.dialog.title, m.dialog.text
+		help = "c: copy | r: raw | enter/esc: close"
 	case dialogLANInfo:
 		title, body = m.dialog.title, m.dialog.text
 		help = "enter/esc: close"

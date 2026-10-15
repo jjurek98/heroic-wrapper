@@ -24,6 +24,7 @@ const (
 	dialogLANJoin
 	dialogLANInfo
 	dialogLANStop
+	dialogLANToken
 	maxPasswordBytes = 4096
 )
 
@@ -34,6 +35,7 @@ type guiDialog struct {
 	title    string
 	text     string
 	confirm  bool // Cancel is selected by default.
+	token    *tokenDialogState
 }
 
 type guiSudoPrompt struct {
@@ -48,6 +50,9 @@ type sudoAttempt struct {
 }
 
 func (m *guiModel) dismissDialog() {
+	if m.dialog.token != nil && m.dialog.token.cancel != nil {
+		m.dialog.token.cancel()
+	}
 	if m.auth != nil {
 		m.auth.cancel()
 		m.auth = nil
@@ -89,6 +94,9 @@ func (m *guiModel) authenticate(password []byte, probe bool) tea.Cmd {
 }
 
 func (m *guiModel) updateDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.dialog.kind == dialogLANToken {
+		return m.updateTokenDialog(msg)
+	}
 	if m.dialog.kind == dialogLANMode || m.dialog.kind == dialogLANJoin || m.dialog.kind == dialogLANInfo {
 		return m.updateLANDialog(msg)
 	}
@@ -217,7 +225,7 @@ func dialogButton(text string, selected bool) string {
 }
 
 func (m *guiModel) dialogContent(width int, compact bool) string {
-	if m.dialog.kind == dialogLANMode || m.dialog.kind == dialogLANJoin || m.dialog.kind == dialogLANInfo {
+	if m.dialog.kind == dialogLANToken || m.dialog.kind == dialogLANMode || m.dialog.kind == dialogLANJoin || m.dialog.kind == dialogLANInfo {
 		return m.lanDialogContent(width, compact)
 	}
 	line := func(text string) string { return clippedLine(text, width) }
