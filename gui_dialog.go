@@ -20,6 +20,10 @@ const (
 	dialogPassword
 	dialogStop
 	dialogQuit
+	dialogLANMode
+	dialogLANJoin
+	dialogLANInfo
+	dialogLANStop
 	maxPasswordBytes = 4096
 )
 
@@ -27,7 +31,15 @@ type guiDialog struct {
 	kind     dialogKind
 	password []byte
 	problem  string
+	title    string
+	text     string
 	confirm  bool // Cancel is selected by default.
+}
+
+type guiSudoPrompt struct {
+	binary, target, reason string
+	proceed                func() tea.Cmd
+	abort                  func()
 }
 
 type sudoAttempt struct {
@@ -42,13 +54,24 @@ func (m *guiModel) dismissDialog() {
 	}
 	clear(m.dialog.password)
 	m.dialog = guiDialog{}
+	m.sudoPrompt = nil
 }
 
 func (m *guiModel) continuePrepared() tea.Cmd {
-	if m.plan.sudo == "" {
-		return m.startPrepared()
+	return m.requestSudo(m.plan.sudo, "Network namespace: "+namespaceLabel(m.network),
+		fmt.Sprintf("Administrator permission is needed to enter the selected network namespace. The game still runs as your user (UID %d, GID %d).", os.Getuid(), os.Getgid()),
+		m.startPrepared, func() {
+			m.busy, m.plan = false, nil
+			m.status = "Launch canceled."
+		})
+}
+
+func (m *guiModel) requestSudo(binary, target, reason string, proceed func() tea.Cmd, abort func()) tea.Cmd {
+	if binary == "" {
+		return proceed()
 	}
 	m.dialog = guiDialog{kind: dialogPassword}
+	m.sudoPrompt = &guiSudoPrompt{binary: binary, target: target, reason: reason, proceed: proceed, abort: abort}
 	m.status = "Checking sudo authentication..."
 	return m.authenticate(nil, true)
 }
@@ -58,7 +81,7 @@ func (m *guiModel) authenticate(password []byte, probe bool) tea.Cmd {
 	attempt := &sudoAttempt{cancel: cancel, probe: probe}
 	m.auth = attempt
 	m.dialog.problem = ""
-	sudo := m.plan.sudo
+	sudo := m.sudoPrompt.binary
 	return func() tea.Msg {
 		defer cancel()
 		return authenticatedMsg{attempt, validateSudo(ctx, sudo, password, probe)}
@@ -66,6 +89,9 @@ func (m *guiModel) authenticate(password []byte, probe bool) tea.Cmd {
 }
 
 func (m *guiModel) updateDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.dialog.kind == dialogLANMode || m.dialog.kind == dialogLANJoin || m.dialog.kind == dialogLANInfo {
+		return m.updateLANDialog(msg)
+	}
 	if m.dialog.kind == dialogPassword {
 		// Match key types, not String(): an IME can deliver a whole word in
 		// one KeyRunes event, and secrets should not become immutable strings.
@@ -73,9 +99,9 @@ func (m *guiModel) updateDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+			abort := m.sudoPrompt.abort
 			m.dismissDialog()
-			m.busy, m.plan = false, nil
-			m.status = "Launch canceled."
+			abort()
 			return m, nil
 		}
 		if m.auth != nil {
@@ -161,12 +187,15 @@ func (m *guiModel) cancelConfirmation() (tea.Model, tea.Cmd) {
 }
 
 func (m *guiModel) acceptConfirmation() (tea.Model, tea.Cmd) {
+	if m.dialog.kind == dialogLANStop {
+		return m.disconnectLAN()
+	}
 	quit := m.dialog.kind == dialogQuit
 	m.dismissDialog()
 	m.stopping = true
 	m.status = "Stopping " + m.playing
 	if quit {
-		m.quitting = true
+		m.quitting, m.lan.stopping, m.lan.ready = true, true, false
 		m.status = "Stopping the launch before quitting..."
 	}
 	if m.session != nil {
@@ -174,9 +203,9 @@ func (m *guiModel) acceptConfirmation() (tea.Model, tea.Cmd) {
 	} else if quit && !m.starting {
 		// Preparation has no child to reap. In-flight starts, on the other
 		// hand, must deliver startedMsg before shutdown can finish.
-		return m, tea.Quit
+		m.busy, m.plan = false, nil
 	}
-	return m, nil
+	return m, m.advanceShutdown()
 }
 
 func dialogButton(text string, selected bool) string {
@@ -188,15 +217,18 @@ func dialogButton(text string, selected bool) string {
 }
 
 func (m *guiModel) dialogContent(width int, compact bool) string {
+	if m.dialog.kind == dialogLANMode || m.dialog.kind == dialogLANJoin || m.dialog.kind == dialogLANInfo {
+		return m.lanDialogContent(width, compact)
+	}
 	line := func(text string) string { return clippedLine(text, width) }
 	var title, reason, input, help string
 	target := m.playing
 	if m.dialog.kind == dialogPassword {
 		title = "Sudo authentication"
-		target = "Network namespace: " + namespaceLabel(m.network)
-		reason = fmt.Sprintf("Administrator permission is needed to enter the selected network namespace. The game still runs as your user (UID %d, GID %d).", os.Getuid(), os.Getgid())
+		target = m.sudoPrompt.target
+		reason = m.sudoPrompt.reason
 		if compact {
-			reason = "sudo is needed to enter the network namespace."
+			reason = "sudo is needed to configure or enter the network namespace."
 		}
 		input = "Password: " + strings.Repeat("*", min(utf8.RuneCount(m.dialog.password), max(0, width-11))) + "_"
 		help = "enter: authenticate | esc: cancel"
@@ -210,10 +242,21 @@ func (m *guiModel) dialogContent(width int, compact bool) string {
 	} else {
 		title, reason = "Stop this game?", "This will stop the running game. Unsaved progress may be lost."
 		button := "Stop game"
+		if m.dialog.kind == dialogLANStop {
+			title, target = "Disconnect this LAN?", "Network namespace: "+lanNamespace
+			reason = "This stops lanparty and all games in the managed games namespace, then removes its veth pair and bridge. Unsaved progress may be lost."
+			button = "Disconnect"
+		}
 		if m.dialog.kind == dialogQuit {
 			title = "Stop and quit?"
 			reason = "This will stop the active launch and close Heroic Wrapper. Unsaved progress may be lost."
 			button = "Stop and quit"
+			if m.lan.busy {
+				reason = "This stops the game and lanparty, removes the managed games namespace, veth and bridge, and closes Heroic Wrapper. Unsaved progress may be lost."
+				if !m.busy {
+					target = "LAN connection / namespace: " + lanNamespace
+				}
+			}
 		}
 		input = dialogButton("Cancel", !m.dialog.confirm) + " " + dialogButton(button, m.dialog.confirm)
 		help = "tab/arrows: choose | enter: accept | esc: cancel"

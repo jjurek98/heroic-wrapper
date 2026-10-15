@@ -28,6 +28,7 @@ type catalogMsg struct {
 	netnsErr   error
 }
 type preparedMsg struct {
+	id      uint64
 	plan    *launchPlan
 	command string
 	err     error
@@ -63,8 +64,13 @@ type guiModel struct {
 	busy        bool
 	stopping    bool
 	starting    bool
+	launchID    uint64
+	gameLAN     bool
 	dialog      guiDialog
 	auth        *sudoAttempt
+	sudoPrompt  *guiSudoPrompt
+	lan         guiLAN
+	lanLogs     bool
 	quitting    bool
 	status      string
 	playing     string
@@ -88,12 +94,14 @@ func runGUI() error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	launcher := &gameLauncher{}
+	lan := newGUILAN()
 	defer func() {
-		cancel()
 		launcher.close()
+		lan.launcher.close()
+		cancel()
 	}()
 	model := &guiModel{
-		ctx: ctx, launcher: launcher, namespaces: []string{""},
+		ctx: ctx, launcher: launcher, lan: lan, namespaces: []string{""},
 		loading: true, status: "Loading installed games...", output: &gameLog{},
 		logView: viewport.New(58, 5), follow: true,
 	}
@@ -154,10 +162,7 @@ func (m *guiModel) launchError(err error) (tea.Model, tea.Cmd) {
 	m.status = "Launch failed: " + err.Error()
 	fmt.Fprintln(m.output, "\n[heroic-wrapper]", m.status)
 	m.syncLogs()
-	if m.quitting {
-		return m, tea.Quit
-	}
-	return m, nil
+	return m, m.advanceShutdown()
 }
 
 func (m *guiModel) startPrepared() tea.Cmd {
@@ -176,8 +181,15 @@ func (m *guiModel) beginLaunch() tea.Cmd {
 	}
 	chosen := m.games[m.matches[m.gameCursor]]
 	namespace := m.namespaces[m.nsCursor]
+	if namespace == lanNamespace && m.lan.busy && (!m.lan.ready || m.lan.stopping) {
+		m.status = "Wait for the LAN connection to become ready before using its namespace."
+		return nil
+	}
 	m.playing = displayLine(chosen.title) + " / " + namespaceLabel(namespace)
 	m.network = namespace
+	m.gameLAN = namespace == lanNamespace && m.lan.ready
+	m.launchID++
+	id := m.launchID
 	m.dismissDialog()
 	m.busy, m.stopping, m.starting, m.plan = true, false, false, nil
 	m.output, m.logRevision, m.follow = &gameLog{}, 0, true
@@ -192,15 +204,15 @@ func (m *guiModel) beginLaunch() tea.Cmd {
 		// `show`, without matching the selected title a second time.
 		command, err := buildCommand(chosen, false, false)
 		if err != nil {
-			return preparedMsg{err: err}
+			return preparedMsg{id: id, err: err}
 		}
 		plan, err := prepareLaunch(command, namespace)
-		return preparedMsg{plan, command, err}
+		return preparedMsg{id: id, plan: plan, command: command, err: err}
 	}
 }
 
 func (m *guiModel) requestQuit() (tea.Model, tea.Cmd) {
-	if !m.busy {
+	if !m.busy && !m.lan.busy {
 		return m, tea.Quit
 	}
 	m.dialog = guiDialog{kind: dialogQuit}
@@ -209,10 +221,18 @@ func (m *guiModel) requestQuit() (tea.Model, tea.Cmd) {
 
 func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
+	case lanStartedMsg:
+		return m.updateLANStarted(msg)
+	case lanTickMsg:
+		return m.updateLANTick(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.logView.Width = max(1, m.width-2)
 		m.logView.Height = max(1, m.height-m.selectorRows()-10)
+		m.lan.view.Width, m.lan.view.Height = m.logView.Width, m.logView.Height
+		if m.lan.follow {
+			m.lan.view.GotoBottom()
+		}
 		if m.follow {
 			m.logView.GotoBottom()
 		}
@@ -222,6 +242,9 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.games, m.namespaces = msg.games, msg.namespaces
 		m.nsCursor, m.gameCursor = 0, 0
 		m.refreshFilter()
+		if m.lan.ready {
+			m.selectLANNamespace()
+		}
 		m.status = fmt.Sprintf("%d installed games. Select a game, then a network namespace.", len(m.games))
 		if msg.gamesErr != nil {
 			m.status = msg.gamesErr.Error() + " (r to retry)"
@@ -233,11 +256,18 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case preparedMsg:
+		if msg.id != m.launchID {
+			return m, nil
+		}
 		if m.quitting {
-			return m, tea.Quit
+			m.busy, m.plan = false, nil
+			return m, m.advanceShutdown()
 		}
 		if msg.err != nil {
 			return m.launchError(msg.err)
+		}
+		if m.gameLAN && !m.lan.ready {
+			return m.launchError(errors.New("LAN disconnected before the game could start"))
 		}
 		m.plan = msg.plan
 		// Show generator notes, but do not dump commands containing secrets.
@@ -266,17 +296,18 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		proceed := m.sudoPrompt.proceed
 		m.dismissDialog()
-		return m, m.startPrepared()
+		return m, proceed()
 	case startedMsg:
 		m.starting = false
 		if msg.err != nil {
 			return m.launchError(msg.err)
 		}
-		m.session, m.focus = msg.session, focusLogs
+		m.session, m.focus, m.lanLogs = msg.session, focusLogs, false
 		m.status = "Running " + m.playing
-		if m.quitting {
-			m.status = "Stopping the launch before quitting..."
+		if m.quitting || (m.gameLAN && !m.lan.ready) || (m.lan.stopping && m.network == lanNamespace) {
+			m.status = "Stopping the launch before network cleanup..."
 			m.session.cancel()
 		}
 		return m, tea.Batch(waitForGame(m.session), logTick(m.session))
@@ -291,8 +322,10 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.busy, m.session, m.plan = false, nil, nil
-		// The game may finish naturally while a confirmation is visible.
-		m.dismissDialog()
+		// Preserve a LAN/password dialog if a game finishes underneath it.
+		if m.dialog.kind == dialogStop || (m.dialog.kind == dialogQuit && !m.lan.busy) {
+			m.dismissDialog()
+		}
 		m.status = "Finished " + m.playing
 		if m.stopping {
 			m.status = "Stopped " + m.playing
@@ -301,10 +334,7 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		fmt.Fprintln(m.output, "\n[heroic-wrapper]", m.status)
 		m.syncLogs()
-		if m.quitting {
-			return m, tea.Quit
-		}
-		return m, nil
+		return m, m.advanceShutdown()
 	case tea.KeyMsg:
 		if m.dialog.kind != dialogNone {
 			return m.updateDialog(msg)
@@ -338,6 +368,16 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m.requestQuit()
 		}
 		switch key {
+		case "l":
+			return m.openLAN()
+		case "f2":
+			m.lanLogs, m.focus = false, focusLogs
+		case "f3":
+			m.lanLogs, m.focus = true, focusLogs
+		case "t":
+			if m.lan.token != "" && (!m.busy || m.session != nil) {
+				m.showLANMessage("LAN server token", m.lan.token)
+			}
 		case "tab":
 			m.focus = (m.focus + 1) % 3
 		case "shift+tab":
@@ -359,8 +399,9 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.dialog = guiDialog{kind: dialogStop}
 			}
 		case "f":
-			m.focus, m.follow = focusLogs, true
-			m.logView.GotoBottom()
+			m.focus = focusLogs
+			*m.activeLogFollow() = true
+			m.activeLogView().GotoBottom()
 		case "enter":
 			if m.width < 60 || m.height < 20 {
 				return m, nil
@@ -372,9 +413,10 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		default:
 			if m.focus == focusLogs {
-				var cmd tea.Cmd
-				m.logView, cmd = m.logView.Update(msg)
-				m.follow = m.logView.AtBottom()
+				view := m.activeLogView()
+				next, cmd := view.Update(msg)
+				*view = next
+				*m.activeLogFollow() = view.AtBottom()
 				return m, cmd
 			}
 			cursor, count := &m.gameCursor, len(m.matches)
@@ -402,9 +444,10 @@ func (m *guiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.focus == focusLogs {
-			var cmd tea.Cmd
-			m.logView, cmd = m.logView.Update(msg)
-			m.follow = m.logView.AtBottom()
+			view := m.activeLogView()
+			next, cmd := view.Update(msg)
+			*view = next
+			*m.activeLogFollow() = view.AtBottom()
 			return m, cmd
 		}
 	}
@@ -487,8 +530,11 @@ func (m *guiModel) layoutView() string {
 	if m.filtering {
 		filter = "Filter: " + m.query + "_  (enter/esc to finish)"
 	}
-	logTitle := "Game logs (stdout + stderr)"
-	if m.follow {
+	logTitle := "Game logs (F2) | LAN logs (F3)"
+	if m.lanLogs {
+		logTitle = "LAN logs (F3) | Game logs (F2)"
+	}
+	if *m.activeLogFollow() {
 		logTitle += " - following"
 	} else {
 		logTitle += " - scroll paused; f to follow"
@@ -498,8 +544,8 @@ func (m *guiModel) layoutView() string {
 		help = "arrows/pgup/pgdown: scroll | f: follow | s: stop | tab: focus | q: quit"
 	}
 	return lipgloss.JoinVertical(lipgloss.Left,
-		guiTitle.Render("Heroic Wrapper"), clippedLine(filter, m.width),
+		guiTitle.Render(clippedLine("Heroic Wrapper | l: LAN connect/disconnect | t: server token", m.width)), clippedLine(filter, m.width),
 		lipgloss.JoinHorizontal(lipgloss.Top, games, namespaces),
-		guiPanel(logTitle, m.logView.View(), m.width-2, m.focus == focusLogs),
-		clippedLine(m.status, m.width), clippedLine(help, m.width))
+		guiPanel(logTitle, m.activeLogView().View(), m.width-2, m.focus == focusLogs),
+		clippedLine("LAN: "+m.lan.status+" | "+m.status, m.width), clippedLine(help, m.width))
 }
